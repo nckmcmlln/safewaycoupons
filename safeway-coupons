@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+
+import argparse
+import configparser
+import email.mime.text
+import itertools
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import time
+import traceback
+from datetime import datetime
+
+import requests
+
+
+# Parse options
+description = "Automatically add online coupons to your Safeway card"
+arg_parser = argparse.ArgumentParser(description=description)
+arg_parser.add_argument(
+    "-d",
+    "--debug",
+    dest="debug",
+    action="store_true",
+    help="Print debugging information on stdout",
+)
+arg_parser.add_argument(
+    "-n",
+    "--no-email",
+    dest="email",
+    action="store_false",
+    help=("Print summary information on standard output " "instead of sending email"),
+)
+arg_parser.add_argument(
+    "-Y",
+    "--no-ycs",
+    dest="ycs",
+    action="store_false",
+    help='Don\'t clip "Your Club Specials" (YCS) items',
+)
+options = arg_parser.parse_args()
+
+email_sender = ""
+auth = [{"username": r"nick.mcmullan@gmail.com", "password": r"q2UKZ79vvWjGnzm"}]
+
+config = configparser.ConfigParser()
+
+if not email_sender:
+    if options.email:
+        print(
+            "Warning: No email_sender defined. Summary information will be "
+            "printed on standard output instead.",
+            file=sys.stderr,
+        )
+        options.email = False
+if len(auth) == 0:
+    raise Exception("No valid accounts defined.")
+
+sleep_multiplier: float = 1.0
+
+referer_data = {
+    "CD": "http://www.safeway.com/ShopStores/Justforu-Coupons.page",
+    "YCS": "http://www.safeway.com/ShopStores/Justforu-YourClubSpecials.page",
+}
+
+user_agent = (
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:53.0) " "Gecko/20100101 Firefox/53.0"
+)
+js_req_headers = {
+    "Content-Type": "application/json",
+    "DNT": "1",
+    "Host": "nimbus.safeway.com",
+    "Origin": "http://www.safeway.com",
+    "SWY_API_KEY": "emjou",
+    "SWY_BANNER": "safeway",
+    "SWY_VERSION": "1.0",
+    "User-Agent": user_agent,
+    "X-Requested-With": "XMLHttpRequest",
+    "X-SWY_API_KEY": "emjou",
+    "X-SWY_BANNER": "safeway",
+    "X-SWY_VERSION": "1.0",
+}
+
+
+class safeway:
+    def __init__(self, auth):
+        self.auth = auth
+        self.mail_message = []
+        self.mail_subject = "Safeway coupons"
+        self.session_headers = {}
+
+        try:
+            self._init_session()
+            self._login()
+            self._clip_coupons()
+        except Exception as e:
+            self.mail_subject += " (error)"
+            self._mail_append("Exception: {}".format(str(e)))
+            for line in traceback.format_exc().split(os.linesep):
+                self._mail_append(line)
+            raise
+        finally:
+            if self.mail_message:
+                self._send_mail()
+
+    def _mail_append(self, line):
+        self.mail_message.append(line)
+
+    def _mail_append_exception(self, e, description):
+        self._mail_append("{}: {}".format(description, str(e)))
+        for line in traceback.format_exc().split(os.linesep):
+            self._mail_append(line)
+
+    def _send_mail(self):
+        email_to = self.auth.get("notify") or self.auth.get("username")
+        email_from = email_sender
+
+        if self.mail_message[0].startswith("Coupon: "):
+            self.mail_message.insert(0, "Clipped coupons for items you buy:")
+
+        account_str = "Safeway account: {}".format(self.auth.get("username"))
+        self.mail_message.insert(0, account_str)
+        mail_message_str = os.linesep.join(self.mail_message)
+
+        if not options.email:
+            print(mail_message_str)
+            return
+
+        self._debug("Sending email to {}".format(email_to))
+        self._debug(">>>>>>")
+        self._debug(mail_message_str)
+        self._debug("<<<<<<")
+
+        email_data = email.mime.text.MIMEText(mail_message_str)
+        email_data["To"] = email_to
+        email_data["From"] = email_from
+        if self.mail_subject:
+            email_data["Subject"] = self.mail_subject
+
+        p = subprocess.Popen(
+            ["/usr/sbin/sendmail", "-f", email_from, "-t"], stdin=subprocess.PIPE
+        )
+        p.communicate(bytes(email_data.as_string(), "UTF-8"))
+
+    def _debug(self, message):
+        if options.debug:
+            print(message)
+
+    def _init_session(self):
+        self.r_s = requests.Session()
+        self.r_a = requests.adapters.HTTPAdapter(pool_maxsize=1)
+        self.r_s.mount("http://", self.r_a)
+        self.r_s.headers.update({"DNT": "1", "User-Agent": user_agent})
+
+    def _login(self):
+        rsp = self._run_request("http://www.safeway.com")
+        rsp.stream = False
+
+        rsp = self._run_request("https://www.safeway.com/ShopStores/" "OSSO-Login.page")
+        rsp.stream = False
+
+        self._debug("Logging in as {}".format(self.auth.get("username")))
+        login_data = {
+            "source": "WEB",
+            "rememberMe": False,
+            "userId": self.auth.get("username"),
+            "password": self.auth.get("password"),
+        }
+        headers = {
+            "Content-type": "application/json",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+        }
+        rsp = self._run_request(
+            ("https://www.safeway.com/iaaw/service/" "authenticate"),
+            json_data=login_data,
+            headers=headers,
+        )
+        rsp_data = json.loads(rsp.content.decode("UTF-8"))
+        if not rsp_data.get("token") or rsp_data.get("errors"):
+            raise Exception("Authentication failure")
+        self.session_headers.update(
+            {
+                "X-swyConsumerDirectoryPro": rsp_data["token"],
+                "X-swyConsumerlbcookie": rsp_data["lbcookie"],
+            }
+        )
+        self.r_s.headers.update(self.session_headers)
+
+    def _run_request(self, url, data=None, json_data=None, headers=None):
+        if data or json_data:
+            return self.r_s.post(url, headers=headers, data=data, json=json_data)
+        return self.r_s.get(url, headers=headers)
+
+    def _get_coupon_details(self, oid, ts, section, coupon_type):
+        headers = js_req_headers
+        headers.update({"Referer": referer_data[section]})
+
+        url = (
+            "https://nimbus.safeway.com/J4UProgram1/services/offer/"
+            "{}/definition/cacheTs/{}"
+        ).format(oid, ts)
+        rsp = self._run_request(url, headers=headers)
+        coupon_data = json.loads(rsp.content.decode("UTF-8"))
+        coupon_detail = coupon_data.get("offerDetail", {})
+        title = ""
+        for title_field in ["titleDsc1", "titleDsc2", "prodDsc1", "prodDsc2"]:
+            if title_field in coupon_detail:
+                if title:
+                    title += " "
+                title += coupon_detail.get(title_field)
+        if coupon_type == "PD":
+            detail = "{} {}".format(
+                coupon_detail.get("priceTitle1", ""),
+                coupon_detail.get("priceValue1", ""),
+            )
+            detail = detail.strip()
+        else:
+            detail = "{}".format(coupon_detail.get("savingsValue", "")).strip()
+        try:
+            end_date_regex = "\\\/Date\(([0-9]{10})[0-9]{3}\)\\\/"
+            expire_ts_unix = int(
+                re.match(end_date_regex, coupon_data["offerEndDt"]).group(1)
+            )
+            expires = datetime.fromtimestamp(expire_ts_unix).strftime("%Y.%m.%d")
+        except Exception as e:
+            self._mail_append_exception(e, "Exception getting coupon details")
+            expires = "Unknown"
+        self._mail_append("Coupon: {} ({}, expires: {})".format(title, detail, expires))
+        rsp.stream = False
+        # Don't blast the server with requests
+        time.sleep(random.uniform(0.05, 0.15) * sleep_multiplier)
+
+    def _clip_coupon(self, oid, section, coupon_type, post_data):
+        headers = js_req_headers
+        headers.update(self.session_headers)
+        headers.update(
+            {
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json;charset=UTF-8",
+                "Referer": referer_data[section],
+            }
+        )
+        url = "https://nimbus.safeway.com/Clipping1/services/clip/items"
+        rsp = self._run_request(url, json_data=post_data, headers=headers)
+        rsp.stream = False
+        c = rsp.json()
+        if "errorCd" in c:
+            raise Exception(
+                'Coupon clipping error code: {} ("{}")'.format(
+                    c["errorCd"], c["errorMsg"]
+                )
+            )
+        return rsp.status_code == 200
+
+    def _clip_coupons(self):
+        clip_counts = {}
+        clip_count = 0
+        error_count = 0
+
+        sections = ["CD"]
+        store_id = None
+        if options.ycs:
+            try:
+                rsp = self._run_request(
+                    "http://www.safeway.com/emlse/"
+                    "services/customer/preference?"
+                    "definitionId=preferredstoreid"
+                )
+                storeid_data = json.loads(rsp.content.decode("UTF-8"))
+                if len(storeid_data["definitions"][0]["values"]) > 0:
+                    store_id = storeid_data["definitions"][0]["values"][0]
+                    sections.append("YCS")
+                else:
+                    self._debug(
+                        "No store ID returned for this account, " "skipping YCS offers."
+                    )
+            except Exception as e:
+                self._mail_append_exception(e, ("Exception getting preferred " "store"))
+
+        try:
+            for section in sections:
+                self._debug("Retrieving {} coupons".format(section))
+                url = (
+                    "https://nimbus.safeway.com/J4UProgram1/services/"
+                    "program/{}/offer/allocations?details=y"
+                    "&hierarchies=y&notes=y"
+                ).format(section)
+                if section == "YCS":
+                    url += "&storeID={}&hierarchies=y".format(store_id)
+                rsp = self._run_request(url)
+                data = rsp.content.decode("UTF-8")
+                offers = json.loads(data)
+                if "offers" not in offers:
+                    raise Exception("Offers not found")
+                for i, offer in enumerate(offers["offers"]):
+                    coupon_type = offer["offerPgm"]
+                    clip_counts.setdefault(coupon_type, 0)
+                    # Check if coupon or offer has been clipped already
+                    check_section = "S" if section == "YCS" else "C"
+                    if offer["clipStatus"] == check_section:
+                        continue
+                    if section == "YCS":
+                        post_data = {
+                            "items": [
+                                {
+                                    "clipType": "L",
+                                    "itemId": offer["offerId"],
+                                    "itemType": coupon_type,
+                                    "storeId": store_id,
+                                }
+                            ]
+                        }
+                    else:
+                        post_data = {"items": []}
+                        for clip_type in ["C", "L"]:
+                            post_data["items"].append(
+                                {
+                                    "clipType": clip_type,
+                                    "itemId": offer["offerId"],
+                                    "itemType": coupon_type,
+                                }
+                            )
+                    oid = offer["offerId"]
+                    clip_success = self._clip_coupon(
+                        oid, section, coupon_type, post_data
+                    )
+                    if clip_success:
+                        self._debug("Clipped coupon " "{} {}".format(coupon_type, oid))
+                        clip_counts[coupon_type] += 1
+                    else:
+                        self._debug(
+                            "Error clipping coupon " "{} {}".format(coupon_type, oid)
+                        )
+                        error_count += 1
+                        if error_count >= 5:
+                            raise Exception(
+                                "Reached error count threshold"
+                                "({:d})".format(error_count)
+                            )
+                    if section != "YCS":
+                        if offer["purchaseInd"] == "B":
+                            self._get_coupon_details(
+                                offer["offerId"], offer["offerTs"], section, coupon_type
+                            )
+                    # Simulate longer pauses for "scrolling" and "paging"
+                    if i > 0 and i % 12 == 0:
+                        if i % 48 == 0:
+                            w = random.uniform(15.0, 25.0)
+                        else:
+                            w = random.uniform(4.0, 8.0)
+                        w *= sleep_multiplier
+                        self._debug("Waiting {} seconds".format(str(w)))
+                        time.sleep(w)
+                    else:
+                        time.sleep(random.uniform(0.3, 0.8) * sleep_multiplier)
+                        pass
+                    clip_count += 1
+        except Exception as e:
+            self._mail_append_exception(e, "Exception clipping coupons")
+
+        if clip_count > 0 or error_count > 0:
+            self.mail_subject += ": {:d} clipped".format(clip_count)
+            self._mail_append("Clipped {:d} coupons total:".format(clip_count))
+            for section_tuple in clip_counts.items():
+                self._mail_append("    {} => {:d} " "coupons".format(*section_tuple))
+            if error_count > 0:
+                self.mail_subject += ", {:d} errors".format(error_count)
+                self._mail_append("Coupon clip errors: " "{:d}".format(error_count))
+
+
+def main():
+    exit_code = 0
+    for index, user_data in enumerate(auth):
+        try:
+            safeway(user_data)
+        except Exception as e:
+            # The safeway class already handles exceptions, but re-raises them
+            # so safeway-coupons can exit with an error code
+            exit_code = 1
+        if index < len(auth) - 1:
+            time.sleep(random.uniform(5.0, 10.0) * sleep_multiplier)
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    print(datetime.now())
+    main()
